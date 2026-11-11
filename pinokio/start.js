@@ -8,6 +8,7 @@ module.exports = {
         env: {
           HOST: '127.0.0.1',
           PORT: '{{port}}',
+          GOOGLE_MAPS_SERVER_API_KEY: '{{env.GOOGLE_MAPS_SERVER_API_KEY || ""}}',
           GOOGLE_MAPS_API_KEY: '{{env.GOOGLE_MAPS_API_KEY || ""}}',
           CESIUM_ION_TOKEN: '{{env.CESIUM_ION_TOKEN || ""}}',
           OPENAI_API_KEY: '{{env.OPENAI_API_KEY || ""}}',
@@ -22,6 +23,8 @@ module.exports = {
           PINOKIO_SHARE_VAR: '{{env.PINOKIO_SHARE_VAR || "__gev_sharing_disabled__"}}',
           GEV_RATELIMIT_OPENAI_PER_MIN: '{{env.GEV_RATELIMIT_OPENAI_PER_MIN || ""}}',
           GEV_RATELIMIT_GOOGLE_PER_MIN: '{{env.GEV_RATELIMIT_GOOGLE_PER_MIN || ""}}',
+          GEV_RATELIMIT_OPENAI_CHAT_PER_MIN: '{{env.GEV_RATELIMIT_OPENAI_CHAT_PER_MIN || ""}}',
+          GEV_RATELIMIT_GEMINI_CHAT_PER_MIN: '{{env.GEV_RATELIMIT_GEMINI_CHAT_PER_MIN || ""}}',
         },
         message: 'node scripts/pinokio-start.mjs',
         on: [{

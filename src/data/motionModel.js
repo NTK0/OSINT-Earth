@@ -29,10 +29,14 @@ export function norm360(deg) {
 export function liftRepeatedGroundFix(newest, candidatePosition, onGround) {
   if (!onGround || !newest?.position || !candidatePosition) return false;
   const stored = Cesium.Cartographic.fromCartesian(
-    newest.position, Cesium.Ellipsoid.WGS84, _mmCarto,
+    newest.position,
+    Cesium.Ellipsoid.WGS84,
+    _mmCarto,
   );
   const candidate = Cesium.Cartographic.fromCartesian(
-    candidatePosition, Cesium.Ellipsoid.WGS84, _mmCandidateCarto,
+    candidatePosition,
+    Cesium.Ellipsoid.WGS84,
+    _mmCandidateCarto,
   );
   if (!stored || !candidate || candidate.height <= stored.height) return false;
   Cesium.Cartesian3.fromRadians(
@@ -62,7 +66,11 @@ export function courseBetweenCartesians(from, to, minChordM = 25) {
   const dy = to.y - from.y;
   const dz = to.z - from.z;
   if (dx * dx + dy * dy + dz * dz < minChordM * minChordM) return null;
-  const carto = Cesium.Cartographic.fromCartesian(from, Cesium.Ellipsoid.WGS84, _mmCarto);
+  const carto = Cesium.Cartographic.fromCartesian(
+    from,
+    Cesium.Ellipsoid.WGS84,
+    _mmCarto,
+  );
   if (!carto) return null;
   const sLat = Math.sin(carto.latitude);
   const cLat = Math.cos(carto.latitude);
@@ -110,7 +118,10 @@ export function speedRamp(speedMps) {
   if (!Number.isFinite(speedMps)) return 1;
   if (speedMps <= COURSE_TRACK_ONLY_MPS) return 0;
   if (speedMps >= COURSE_CHORD_ONLY_MPS) return 1;
-  return (speedMps - COURSE_TRACK_ONLY_MPS) / (COURSE_CHORD_ONLY_MPS - COURSE_TRACK_ONLY_MPS);
+  return (
+    (speedMps - COURSE_TRACK_ONLY_MPS) /
+    (COURSE_CHORD_ONLY_MPS - COURSE_TRACK_ONLY_MPS)
+  );
 }
 
 /** Shortest-arc angle lerp: from → to by t (t=0 → from, t=1 → to). Also the
@@ -141,10 +152,16 @@ export function displayedKinematics({
   reportedTrackDeg,
 } = {}) {
   return {
-    speedMps: Number.isFinite(derivedSpeedMps) ? Math.max(0, derivedSpeedMps)
-      : (Number.isFinite(reportedSpeedMps) ? Math.max(0, reportedSpeedMps) : null),
-    trackDeg: Number.isFinite(derivedTrackDeg) ? derivedTrackDeg
-      : (Number.isFinite(reportedTrackDeg) ? reportedTrackDeg : null),
+    speedMps: Number.isFinite(derivedSpeedMps)
+      ? Math.max(0, derivedSpeedMps)
+      : Number.isFinite(reportedSpeedMps)
+        ? Math.max(0, reportedSpeedMps)
+        : null,
+    trackDeg: Number.isFinite(derivedTrackDeg)
+      ? derivedTrackDeg
+      : Number.isFinite(reportedTrackDeg)
+        ? reportedTrackDeg
+        : null,
   };
 }
 
@@ -167,11 +184,169 @@ export function staleCoastLimitSeconds({
   maximumSec = 300,
 } = {}) {
   const floor = Math.max(0, Number.isFinite(minimumSec) ? minimumSec : 60);
-  const ceiling = Math.max(floor, Number.isFinite(maximumSec) ? maximumSec : 300);
-  if (!Number.isFinite(fixEpochMs) || !Number.isFinite(lastContactEpochMs)) return floor;
+  const ceiling = Math.max(
+    floor,
+    Number.isFinite(maximumSec) ? maximumSec : 300,
+  );
+  if (!Number.isFinite(fixEpochMs) || !Number.isFinite(lastContactEpochMs))
+    return floor;
   const contactLeadSec = Math.max(0, (lastContactEpochMs - fixEpochMs) / 1000);
-  const grace = Math.max(0, Number.isFinite(contactGraceSec) ? contactGraceSec : 60);
+  const grace = Math.max(
+    0,
+    Number.isFinite(contactGraceSec) ? contactGraceSec : 60,
+  );
   return Math.min(ceiling, Math.max(floor, contactLeadSec + grace));
+}
+
+/** @constant {number} Dead reckoning never moves a contact faster than this
+ *  (1,500 kt, the trail's continuity limit), so a corrupt reported speed
+ *  cannot fly a coasting plane hundreds of kilometres. */
+export const COAST_MAX_SPEED_MPS = (1_500 * 1852) / 3600;
+
+/** @constant {number} A contact with no fresh report coasts at most this long past it, whatever its source limit; there is no distance cap. */
+export const STALE_COAST_MAX_SEC = 300;
+
+/** @constant {number} A report this close to a known ground height holds
+ *  instead of coasting. */
+export const STALE_HOLD_MAX_HEIGHT_M = 150;
+
+/**
+ * Whether a contact whose reports have stopped holds at its last reported
+ * position instead of coasting: it reported on the ground, or a known ground
+ * floor puts it within STALE_HOLD_MAX_HEIGHT_M of the ground (landing or
+ * taking off). A plane that low has no evidence of being anywhere but where
+ * it was last heard. Where the ground is unknown, barometric altitude is not
+ * read as height above it; the contact coasts under the stale cap.
+ * @param {object} report
+ * @param {boolean} [report.onGround]
+ * @param {number} [report.heightM] - Render height (ellipsoidal metres).
+ * @param {number} [report.groundM] - Ellipsoidal ground under the report, if known.
+ * @returns {boolean}
+ */
+export function staleHoldsAtLastReport({ onGround, heightM, groundM } = {}) {
+  if (onGround === true) return true;
+  return (
+    Number.isFinite(heightM) &&
+    Number.isFinite(groundM) &&
+    heightM - groundM < STALE_HOLD_MAX_HEIGHT_M
+  );
+}
+
+/**
+ * The hold-or-coast decision for a report, made once and kept on the report,
+ * so a ground floor that resolves while the contact coasts cannot flip it and
+ * snap the icon back. Height and position come from the report itself.
+ * @param {{position: Cesium.Cartesian3, staleHolds?: boolean}} fix - History
+ *   fix; `staleHolds` is stored on it.
+ * @param {object} args
+ * @param {boolean} [args.onGround] - The contact's ground flag.
+ * @param {(latDeg: number, lonDeg: number) => number|null} [args.cachedGroundFloor]
+ * @returns {boolean}
+ */
+export function staleHoldsForFix(fix, { onGround, cachedGroundFloor } = {}) {
+  if (typeof fix.staleHolds === 'boolean') return fix.staleHolds;
+  const carto = Cesium.Cartographic.fromCartesian(
+    fix.position,
+    Cesium.Ellipsoid.WGS84,
+    _holdCarto,
+  );
+  const groundM =
+    carto && typeof cachedGroundFloor === 'function'
+      ? cachedGroundFloor(
+          Cesium.Math.toDegrees(carto.latitude),
+          Cesium.Math.toDegrees(carto.longitude),
+        )
+      : null;
+  fix.staleHolds = staleHoldsAtLastReport({
+    onGround,
+    heightM: carto?.height,
+    groundM,
+  });
+  return fix.staleHolds;
+}
+
+const _holdCarto = new Cesium.Cartographic();
+
+/**
+ * Seconds a contact coasts past `newest` at a display time `elapsedSec`
+ * after it, counting any coast a synthetic fix already took since the real
+ * report it was built from (`reportEpochMs`), so a chain of synthetic fixes
+ * never coasts further than one report would.
+ * @param {object} args
+ * @param {{epochMs: number, reportEpochMs?: number, velocity?: number}} args.newest
+ * @param {number} args.elapsedSec - Display time past `newest`.
+ * @param {number} args.coastLimitSec - Source limit past `newest`.
+ * @param {boolean} args.holds
+ * @returns {number}
+ */
+export function staleCoastSecondsFrom({
+  newest,
+  elapsedSec,
+  coastLimitSec,
+  holds,
+}) {
+  const alreadySec = Number.isFinite(newest?.reportEpochMs)
+    ? Math.max(0, (newest.epochMs - newest.reportEpochMs) / 1000)
+    : 0;
+  return Math.max(
+    0,
+    staleCoastSeconds({
+      elapsedSec: elapsedSec + alreadySec,
+      coastLimitSec: coastLimitSec + alreadySec,
+      holds,
+    }) - alreadySec,
+  );
+}
+
+/** @constant {number} A coasted position sits at least this far (m) above the ground. */
+export const COAST_FLOOR_LIFT_M = 1.5;
+
+/**
+ * Lift a coasted position to COAST_FLOOR_LIFT_M above the ground where the
+ * ground is known; a coast runs level from the report and terrain may rise
+ * under it.
+ * @param {Cesium.Cartesian3} position - Mutated in place.
+ * @param {(latDeg: number, lonDeg: number) => number|null} [cachedGroundFloor]
+ * @returns {Cesium.Cartesian3}
+ */
+export function floorCoastedPosition(position, cachedGroundFloor) {
+  if (typeof cachedGroundFloor !== 'function') return position;
+  const carto = Cesium.Cartographic.fromCartesian(
+    position,
+    Cesium.Ellipsoid.WGS84,
+    _coastCarto,
+  );
+  if (!carto) return position;
+  const ground = cachedGroundFloor(
+    Cesium.Math.toDegrees(carto.latitude),
+    Cesium.Math.toDegrees(carto.longitude),
+  );
+  if (!Number.isFinite(ground) || carto.height >= ground + COAST_FLOOR_LIFT_M)
+    return position;
+  return Cesium.Cartesian3.fromRadians(
+    carto.longitude,
+    carto.latitude,
+    ground + COAST_FLOOR_LIFT_M,
+    Cesium.Ellipsoid.WGS84,
+    position,
+  );
+}
+
+const _coastCarto = new Cesium.Cartographic();
+
+/**
+ * Seconds to coast past the last report: the elapsed time, bounded by the
+ * source's coast limit and STALE_COAST_MAX_SEC; none for a contact that
+ * holds.
+ * @param {object} args
+ * @param {number} args.elapsedSec - Display time past the last report.
+ * @param {number} args.coastLimitSec - From `staleCoastLimitSeconds`.
+ * @param {boolean} args.holds - From `staleHoldsAtLastReport`.
+ * @returns {number}
+ */
+export function staleCoastSeconds({ elapsedSec, coastLimitSec, holds }) {
+  if (holds || !(elapsedSec > 0)) return 0;
+  return Math.max(0, Math.min(elapsedSec, coastLimitSec, STALE_COAST_MAX_SEC));
 }
 
 /**
@@ -197,18 +372,31 @@ export function limitCourseStep(prevDeg, targetDeg, maxDegPerSec, dtSec) {
  * is GPS-vector noise, not a turn (samples without a speed keep the legacy
  * behavior: no way to tell, so they still count).
  */
-export function estimateTurnRateDps(samples, noiseFloorDps = 0.4, maxDps = 4, minSpeedMps = 0) {
+export function estimateTurnRateDps(
+  samples,
+  noiseFloorDps = 0.4,
+  maxDps = 4,
+  minSpeedMps = 0,
+) {
   if (!samples || samples.length < 2) return 0;
   let sum = 0;
   let n = 0;
   for (let i = 1; i < samples.length; i++) {
     const dt = samples[i].tSec - samples[i - 1].tSec;
     if (dt < 2 || dt > 120) continue;
-    if (!Number.isFinite(samples[i].trackDeg) || !Number.isFinite(samples[i - 1].trackDeg)) continue;
+    if (
+      !Number.isFinite(samples[i].trackDeg) ||
+      !Number.isFinite(samples[i - 1].trackDeg)
+    )
+      continue;
     if (minSpeedMps > 0) {
       const v0 = samples[i - 1].speedMps;
       const v1 = samples[i].speedMps;
-      if ((Number.isFinite(v0) && v0 < minSpeedMps) || (Number.isFinite(v1) && v1 < minSpeedMps)) continue;
+      if (
+        (Number.isFinite(v0) && v0 < minSpeedMps) ||
+        (Number.isFinite(v1) && v1 < minSpeedMps)
+      )
+        continue;
     }
     sum += norm180(samples[i].trackDeg - samples[i - 1].trackDeg) / dt;
     n += 1;
@@ -274,13 +462,31 @@ const _scratchProjectArc = { east: 0, north: 0, endCourseDeg: 0 };
  * @param {number} dtSec - Seconds ahead; 0 or negative returns the start.
  * @returns {{lat: number, lon: number}} Projected coordinate, degrees.
  */
-export function projectGroundArcLatLon(lat, lon, courseDeg, speedMps, turnRateDps, dtSec) {
+export function projectGroundArcLatLon(
+  lat,
+  lon,
+  courseDeg,
+  speedMps,
+  turnRateDps,
+  dtSec,
+) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return { lat, lon };
-  if (!Number.isFinite(courseDeg) || !Number.isFinite(speedMps) || !Number.isFinite(dtSec)
-    || speedMps <= 0 || dtSec <= 0) {
+  if (
+    !Number.isFinite(courseDeg) ||
+    !Number.isFinite(speedMps) ||
+    !Number.isFinite(dtSec) ||
+    speedMps <= 0 ||
+    dtSec <= 0
+  ) {
     return { lat, lon };
   }
-  const off = arcOffsetEnu(speedMps, courseDeg, turnRateDps || 0, dtSec, _scratchProjectArc);
+  const off = arcOffsetEnu(
+    speedMps,
+    courseDeg,
+    turnRateDps || 0,
+    dtSec,
+    _scratchProjectArc,
+  );
   // Guard the pole: cos(lat) → 0 would send the longitude to infinity.
   const cosLat = Math.max(Math.cos(lat * DEG), 1e-6);
   return {
@@ -320,8 +526,15 @@ export function projectGroundArcLatLon(lat, lon, courseDeg, speedMps, turnRateDp
  * @returns {Array<{lat: number, lon: number}>} Polyline, display position first.
  */
 export function corridorPathLatLon({
-  extrapolating, displayLat, displayLon, courseDeg, speedMps, turnRateDps = 0,
-  fixLat, fixLon, lookaheadSec,
+  extrapolating,
+  displayLat,
+  displayLon,
+  courseDeg,
+  speedMps,
+  turnRateDps = 0,
+  fixLat,
+  fixLon,
+  lookaheadSec,
 }) {
   if (!Number.isFinite(displayLat) || !Number.isFinite(displayLon)) return [];
   const start = { lat: displayLat, lon: displayLon };
@@ -338,9 +551,16 @@ export function corridorPathLatLon({
   const n = Math.max(1, Math.ceil(arcLengthM / CORRIDOR_SAMPLE_SPACING_M));
   const out = [start];
   for (let i = 1; i <= n; i++) {
-    out.push(projectGroundArcLatLon(
-      displayLat, displayLon, courseDeg, speed, turnRateDps, cappedSec * (i / n),
-    ));
+    out.push(
+      projectGroundArcLatLon(
+        displayLat,
+        displayLon,
+        courseDeg,
+        speed,
+        turnRateDps,
+        cappedSec * (i / n),
+      ),
+    );
   }
   return out;
 }
@@ -377,23 +597,42 @@ const _forwardFixOffset = new Cesium.Cartesian3();
  * kinematics. This prevents a late course change from reprojecting the entire
  * stale interval and snapping the rendered contact by kilometres.
  *
+ * The same stale rules as the display apply: no fix for a contact that holds
+ * at its report (`staleHoldsForFix`, decided before calling), a coast of at
+ * most STALE_COAST_MAX_SEC counted from the real report
+ * (`reportEpochMs` carries it along a chain), and never below known ground.
+ * The result is a motion fix only, never a report for the trail.
+ *
  * @param {{time: Cesium.JulianDate, epochMs?: number, position: Cesium.Cartesian3,
- *   velocity?: number, track?: number}} newest Existing immutable history fix.
- * @param {{epochMs: number, velocity: number, track: number, turnRateDps?: number}} next
+ *   velocity?: number, track?: number, staleHolds?: boolean, reportEpochMs?: number}} newest
+ *   Existing immutable history fix.
+ * @param {{epochMs: number, velocity: number, track: number, turnRateDps?: number,
+ *   cachedGroundFloor?: Function}} next
  *   New kinematics and the wall/source epoch at which they become authoritative.
  * @returns {{time: Cesium.JulianDate, epochMs: number, position: Cesium.Cartesian3,
- *   velocity: number, track: number}|null} Forward synthetic fix, or null.
+ *   velocity: number, track: number, staleHolds?: boolean, reportEpochMs: number}|null}
+ *   Forward synthetic fix, or null.
  */
 export function synthesizeForwardKinematicsFix(newest, next = {}) {
-  if (!newest?.position || !newest?.time || !Number.isFinite(next.epochMs)) return null;
+  if (!newest?.position || !newest?.time || !Number.isFinite(next.epochMs))
+    return null;
   const startEpochMs = Number.isFinite(newest.epochMs)
     ? newest.epochMs
     : Cesium.JulianDate.toDate(newest.time).getTime();
-  if (!Number.isFinite(startEpochMs) || next.epochMs <= startEpochMs) return null;
+  if (!Number.isFinite(startEpochMs) || next.epochMs <= startEpochMs)
+    return null;
+  if (newest.staleHolds === true) return null;
 
-  const previousVelocity = Number.isFinite(newest.velocity) ? Math.max(0, newest.velocity) : 0;
+  const previousVelocity = Number.isFinite(newest.velocity)
+    ? Math.max(0, newest.velocity)
+    : 0;
   const previousTrack = Number.isFinite(newest.track) ? newest.track : 0;
-  const dtSec = (next.epochMs - startEpochMs) / 1000;
+  const dtSec = staleCoastSecondsFrom({
+    newest: { epochMs: startEpochMs, reportEpochMs: newest.reportEpochMs },
+    elapsedSec: (next.epochMs - startEpochMs) / 1000,
+    coastLimitSec: Infinity,
+    holds: false,
+  });
   arcOffsetEnu(
     previousVelocity,
     previousTrack,
@@ -412,16 +651,25 @@ export function synthesizeForwardKinematicsFix(newest, next = {}) {
     Cesium.Ellipsoid.WGS84,
     _forwardFixEnu,
   );
-  const position = Cesium.Matrix4.multiplyByPoint(
-    enu,
-    _forwardFixOffset,
-    new Cesium.Cartesian3(),
+  const position = floorCoastedPosition(
+    Cesium.Matrix4.multiplyByPoint(
+      enu,
+      _forwardFixOffset,
+      new Cesium.Cartesian3(),
+    ),
+    next.cachedGroundFloor,
   );
   return {
     time: Cesium.JulianDate.fromDate(new Date(next.epochMs)),
     epochMs: next.epochMs,
+    reportEpochMs: Number.isFinite(newest.reportEpochMs)
+      ? newest.reportEpochMs
+      : startEpochMs,
+    staleHolds: newest.staleHolds,
     position,
-    velocity: Number.isFinite(next.velocity) ? Math.max(0, next.velocity) : previousVelocity,
+    velocity: Number.isFinite(next.velocity)
+      ? Math.max(0, next.velocity)
+      : previousVelocity,
     track: Number.isFinite(next.track) ? next.track : previousTrack,
   };
 }

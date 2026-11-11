@@ -16,6 +16,7 @@ module.exports = {
         // child also reads the raw app ENVIRONMENT file because Pinokio removes
         // blank fields before constructing this merged template environment.
         env: {
+          GOOGLE_MAPS_SERVER_API_KEY: '{{env.GOOGLE_MAPS_SERVER_API_KEY || ""}}',
           GOOGLE_MAPS_API_KEY: '{{env.GOOGLE_MAPS_API_KEY || ""}}',
           CESIUM_ION_TOKEN: '{{env.CESIUM_ION_TOKEN || ""}}',
           OPENAI_API_KEY: '{{env.OPENAI_API_KEY || ""}}',
@@ -27,6 +28,8 @@ module.exports = {
           LL2_API_TOKEN: '{{env.LL2_API_TOKEN || ""}}',
           GEV_RATELIMIT_OPENAI_PER_MIN: '{{env.GEV_RATELIMIT_OPENAI_PER_MIN || ""}}',
           GEV_RATELIMIT_GOOGLE_PER_MIN: '{{env.GEV_RATELIMIT_GOOGLE_PER_MIN || ""}}',
+          GEV_RATELIMIT_OPENAI_CHAT_PER_MIN: '{{env.GEV_RATELIMIT_OPENAI_CHAT_PER_MIN || ""}}',
+          GEV_RATELIMIT_GEMINI_CHAT_PER_MIN: '{{env.GEV_RATELIMIT_GEMINI_CHAT_PER_MIN || ""}}',
         },
         message: 'node scripts/pinokio-install.mjs',
       },

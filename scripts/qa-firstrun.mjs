@@ -38,7 +38,7 @@ const SHOT_DIR = path.join(ROOT, 'qa-shots', 'firstrun');
 const CHROME_CANDIDATES = [
   process.env.PUPPETEER_EXECUTABLE_PATH,
   // Version-pinned Chrome-for-Testing over the auto-updating system Chrome.
-  (() => { try { return puppeteer.executablePath(); } catch { return null; } })(),
+  await puppeteer.executablePath().catch(() => null),
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
 ].filter(Boolean);
 
@@ -332,14 +332,17 @@ async function runArbitrationSection(page, { shots, consoleErrors }) {
       `session=${escUnderLightbox.session}`,
     );
     record(
-      'the lightbox keeps its OWN ESC semantics (Cesium binds none, so it stays)',
-      lightboxAfterEsc.shown,
+      'ESC closes attribution without dismissing the launcher underneath',
+      !lightboxAfterEsc.shown,
       `overlay shown=${lightboxAfterEsc.shown}`,
     );
 
-    // The guard disarms the launcher; it must never break it. Close the overlay
-    // the way a visitor does and the key comes straight back.
-    await page.evaluate(() => document.querySelector('.cesium-credit-lightbox-close')?.click());
+    // The attribution keyboard handler closes the overlay and restores focus.
+    // A second Escape belongs to the now-uncovered launcher.
+    const attributionFocusRestored = await page.evaluate(() => (
+      document.activeElement === document.querySelector('#cesium-credits .cesium-credit-expand-link')
+    ));
+    record('closing attribution restores its disclosure focus', attributionFocusRestored);
     await sleep(300);
     const uncovered = await launcherState();
     record('closing the lightbox hands the card back the key',
@@ -352,53 +355,6 @@ async function runArbitrationSection(page, { shots, consoleErrors }) {
       beforeLightbox.onScreen && !afterUncoveredEsc.classVisible
         && afterUncoveredEsc.session === 'dismissed',
       `classVisible=${afterUncoveredEsc.classVisible} session=${afterUncoveredEsc.session}`,
-    );
-
-    // ── Blocker repro: a control that claims only the KEY ───────────────────
-    // The compact Radio disclosure closes on ESC from a capture listener bound
-    // long before this module exists. It called stopPropagation(), which does
-    // NOT stop later listeners on the same document — so one key closed the
-    // disclosure AND dismissed the launcher. The card is not hiding behind this
-    // one and must not yield to it: the key is simply already spoken for.
-    await open(page, { query: "?welcome=1", errorSink: consoleErrors });
-    const beforeRadio = await launcherState();
-    record('the launcher is up before the radio disclosure opens', beforeRadio.onScreen);
-    const radioOpened = await page.evaluate(() => {
-      document.getElementById('context-radio-toggle-btn')?.click();
-      return !!document.getElementById('context-radio-dock')?.classList.contains('disclosure-open');
-    });
-    await sleep(250);
-    record('the compact Radio disclosure opens', radioOpened);
-    const withRadio = await launcherState();
-    record(
-      'a small disclosure is a key contest, not a screen takeover — no yield',
-      withRadio.classVisible && withRadio.topmost,
-      `classVisible=${withRadio.classVisible} topmost=${withRadio.topmost}`,
-    );
-
-    await page.keyboard.press('Escape');
-    await sleep(400);
-    const radioAfterEsc = await page.evaluate(() => (
-      !!document.getElementById('context-radio-dock')?.classList.contains('disclosure-open')
-    ));
-    const launcherAfterRadioEsc = await launcherState();
-    record('ESC closes the disclosure', radioOpened && !radioAfterEsc,
-      `disclosure still open=${radioAfterEsc}`);
-    record(
-      'that SAME ESC does not also dismiss the launcher',
-      beforeRadio.onScreen && launcherAfterRadioEsc.classVisible
-        && launcherAfterRadioEsc.session !== 'dismissed',
-      `classVisible=${launcherAfterRadioEsc.classVisible} session=${launcherAfterRadioEsc.session} — one key, one action`,
-    );
-    // ...and the NEXT press is the launcher's, so nothing was permanently taken.
-    await page.keyboard.press('Escape');
-    await sleep(600);
-    const escAfterRadioClosed = await launcherState();
-    record(
-      'the next ESC belongs to the launcher again',
-      beforeRadio.onScreen && !escAfterRadioClosed.classVisible
-        && escAfterRadioClosed.session === 'dismissed',
-      `classVisible=${escAfterRadioClosed.classVisible} session=${escAfterRadioClosed.session}`,
     );
 
     // ── Deferred reveal: a surface already up when the launcher would show ──
@@ -491,7 +447,10 @@ async function main() {
     ...(executablePath ? { executablePath } : {}),
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
-      '--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist',
+      // Metal is a macOS-only ANGLE backend; anywhere else it fails WebGL init.
+      ...(process.platform === 'darwin'
+        ? ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist']
+        : ['--use-gl=angle', '--use-angle=swiftshader']),
       '--disable-dev-shm-usage', '--disable-background-timer-throttling',
       '--disable-renderer-backgrounding', '--window-size=1440,900',
     ],

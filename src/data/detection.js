@@ -1,3 +1,4 @@
+import { paintTransitBracket } from './detectionDraw.js';
 import * as Cesium from 'cesium';
 import { governorRequestRender } from '../renderGovernor.js';
 import {
@@ -10,6 +11,7 @@ import {
 import {
   acquireAlpha,
   appendCornerBracket,
+  appendTransitBracket,
   resolveTier,
   measureTrackLabel,
   nearFarScale,
@@ -19,7 +21,10 @@ import {
   getKeyholeFadeTuning,
   keyholeLabelAlphaFromGeometry,
 } from '../celestialRing.js';
-import { registerWorldOverlayPaintLane } from '../overlays/worldOverlay.js';
+import {
+  getQueuedOverlayEntryAlpha,
+  registerWorldOverlayPaintLane,
+} from '../overlays/worldOverlay.js';
 import {
   DETECTION_STYLE,
   DETECTION_THEME_MAP,
@@ -41,11 +46,24 @@ import {
   detectionHorizontalSector,
   labelBudgetFor,
   normalizeAllocationStrategy,
-  normalizeProfile,
   profileForDensity,
   viewScaleForAltitude,
 } from './detectionPolicy.js';
 import { detectionBracketOpacity } from './detectionPresentation.js';
+import { SurfaceOcclusion } from './detectionOcclusion.js';
+import { SceneOcclusionProbe } from './sceneOcclusionProbe.js';
+import {
+  createCyberSonarSampler,
+  cyberSonarFrameDelay,
+  isCyberContactSonarActive as isCyberSonarActive,
+  isCyberContactThemeActive as isCyberMapThemeActive,
+} from '../cyberSonar.js';
+import {
+  awarenessEchoActive,
+  awarenessEchoBracket,
+  awarenessEchoColor,
+  getAwarenessEchoField,
+} from '../awarenessEcho.js';
 
 /**
  * @module detection
@@ -94,8 +112,12 @@ const THEME_MAP = DETECTION_THEME_MAP;
 const SPARSE_ZONE_FRACTION = 0.5;
 /** Solve cadence for membership/collision; accepted identities still reproject every frame. */
 const LABEL_SOLVE_INTERVAL_MS = 125;
+/** Own-card opacity that fully hides a callout; below it the callout fades in. */
+const CARD_ALPHA_HIDING_CALLOUT = 0.5;
 /** Alpha bands retain bracket batching while approximating a continuous radial fade. */
 const BRACKET_ALPHA_STEPS = 4;
+/** Finer bands for Global Context echo brackets, whose fade is animated. */
+const ECHO_ALPHA_STEPS = 8;
 /** Stable per-layer candidate safety cap; independent of density and camera bearing. */
 const LAYER_CANDIDATE_CAP = 2600;
 const LAYER_WEIGHTS = Object.freeze({
@@ -204,6 +226,8 @@ let _lastRenderMs = 0;
 let _lastPaintMs = 0;
 let _lastSolveMs = 0;
 let _throttleSkipCount = 0;
+let _lastCyberSonarPaintAt = Number.NEGATIVE_INFINITY;
+let _cyberSonarRenderTimer = null;
 /** @type {Function|null} External callback invoked when the detection mode changes */
 let _onModeChange = null;
 /** @type {{surface:HTMLCanvasElement|null,setActive:Function,requestPaint:Function,unregister:Function}|null} */
@@ -217,6 +241,8 @@ let _hostLane = null;
  * @type {{surface:HTMLCanvasElement|null,setActive:Function,requestPaint:Function,unregister:Function}|null}
  */
 let _calloutLane = null;
+let _transitBracketPaths = new Map();
+let _transitBracketAlpha = 1;
 /**
  * Callouts solved by the sensor lane this frame, replayed by the callout lane.
  * The array and its rows are POOLED — `_calloutCount` is the live length — so a
@@ -244,6 +270,22 @@ let _allocationStrategy = ALLOCATION_ELASTIC;
 let _lastNonOffMode = MODE_BALANCED;
 /** @type {LabelArbiter} Shared stable callout selector. */
 const _labelArbiter = new LabelArbiter();
+/**
+ * Hides the bracket and callout of a depth-tested contact (a street vehicle)
+ * that the scene drew something in front of. `_occlusionProbe` asks the GPU
+ * about each such contact without waiting for the answer; `_surfaceOcclusion`
+ * remembers the answers and decides, every frame, who is drawn.
+ */
+const _occlusionProbe = new SceneOcclusionProbe();
+const _surfaceOcclusion = new SurfaceOcclusion(_occlusionProbe);
+/**
+ * Keys of callouts the label arbiter still holds for contacts last seen
+ * hidden. A key stays here until its contact is seen drawn again or the
+ * arbiter lets the callout go, so the callout cannot come back at its old
+ * place just because its contact has since left the view.
+ */
+const _surfaceSuppressedKeys = new Set();
+let _surfaceDepthFallbackReported = false;
 let _lastLabelSolveAt = 0;
 let _labelSolveDirty = true;
 let _lastDiagnostics = null;
@@ -275,7 +317,10 @@ let _cockpitModeListener = null;
  */
 export function initDetection(viewer, layers, onModeChange) {
   if (_cockpitModeListener && typeof window !== 'undefined') {
-    window.removeEventListener('gev:cockpit-mode-changed', _cockpitModeListener);
+    window.removeEventListener(
+      'gev:cockpit-mode-changed',
+      _cockpitModeListener,
+    );
   }
   _hostLane?.unregister?.();
   _calloutLane?.unregister?.();
@@ -318,8 +363,12 @@ export function initDetection(viewer, layers, onModeChange) {
 
 /** Release the host lane and all retained detection runtime state. */
 export function destroyDetection() {
+  _clearCyberSonarRenderTimer();
   if (_cockpitModeListener && typeof window !== 'undefined') {
-    window.removeEventListener('gev:cockpit-mode-changed', _cockpitModeListener);
+    window.removeEventListener(
+      'gev:cockpit-mode-changed',
+      _cockpitModeListener,
+    );
   }
   _cockpitModeListener = null;
   _cockpitActive = false;
@@ -329,6 +378,7 @@ export function destroyDetection() {
   _hostLane = null;
   _calloutLane?.unregister?.();
   _calloutLane = null;
+  _transitBracketPaths.clear();
   _calloutCount = 0;
   _viewer = null;
   _layers = [];
@@ -340,6 +390,9 @@ export function destroyDetection() {
   _suspended = false;
   _suspendReason = '';
   _labelArbiter.clear();
+  _surfaceOcclusion.clear();
+  _surfaceSuppressedKeys.clear();
+  _occlusionProbe.destroy();
   _lastLabelSolveAt = 0;
   _labelSolveDirty = true;
   _lastDiagnostics = null;
@@ -351,6 +404,25 @@ export function destroyDetection() {
   _lastPaintMs = 0;
   _lastSolveMs = 0;
   _throttleSkipCount = 0;
+  _lastCyberSonarPaintAt = Number.NEGATIVE_INFINITY;
+}
+
+function _clearCyberSonarRenderTimer() {
+  if (_cyberSonarRenderTimer != null) {
+    globalThis.clearTimeout?.(_cyberSonarRenderTimer);
+    _cyberSonarRenderTimer = null;
+  }
+}
+
+function _scheduleCyberSonarRender(nowMs) {
+  if (_cyberSonarRenderTimer != null || !globalThis.setTimeout) return;
+  const delay = cyberSonarFrameDelay(_lastCyberSonarPaintAt, nowMs);
+  _cyberSonarRenderTimer = globalThis.setTimeout(() => {
+    _cyberSonarRenderTimer = null;
+    if (isCyberSonarActive()) {
+      governorRequestRender('cyber-sonar-cadence');
+    }
+  }, delay);
 }
 
 /**
@@ -392,7 +464,8 @@ export function setMode(modeLabel) {
     _mode = MODE_OFF;
   } else {
     const requestedDensity = defaultDensityForProfile(target);
-    if (profileForDensity(_densityPct) !== target) _densityPct = requestedDensity;
+    if (profileForDensity(_densityPct) !== target)
+      _densityPct = requestedDensity;
     _mode = _modeForDensity();
     _lastNonOffMode = _mode;
   }
@@ -457,7 +530,10 @@ export function isDetectionSuspended() {
  */
 export function setDetectionTuning(options = {}) {
   let modeChanged = false;
-  if (typeof options.densityPct === 'number' && Number.isFinite(options.densityPct)) {
+  if (
+    typeof options.densityPct === 'number' &&
+    Number.isFinite(options.densityPct)
+  ) {
     const nextDensity = canonicalizeDensity(options.densityPct);
     if (nextDensity !== _densityPct) {
       _densityPct = nextDensity;
@@ -472,7 +548,10 @@ export function setDetectionTuning(options = {}) {
     }
   }
   if (options.allocationStrategy != null) {
-    const nextStrategy = normalizeAllocationStrategy(options.allocationStrategy, _allocationStrategy);
+    const nextStrategy = normalizeAllocationStrategy(
+      options.allocationStrategy,
+      _allocationStrategy,
+    );
     if (nextStrategy !== _allocationStrategy) {
       _allocationStrategy = nextStrategy;
       _labelSolveDirty = true;
@@ -517,7 +596,15 @@ export function markDetectionSourcesChanged(reason = 'sources-changed') {
 
 /** Read-only diagnostics for unit/browser QA. */
 export function getDetectionDiagnostics() {
-  return _lastDiagnostics ? JSON.parse(JSON.stringify(_lastDiagnostics)) : null;
+  if (!_lastDiagnostics) return null;
+  const result = JSON.parse(JSON.stringify(_lastDiagnostics));
+  // Readback only: expose painted plates so pixel QA can exclude occluded
+  // sprites/strokes. Nothing is copied on the production paint path.
+  result.calloutRects = _calloutPool
+    .slice(0, _calloutCount)
+    .filter((row) => row.paintAlpha > 0.001)
+    .map(({ x, y, w, h, paintAlpha }) => ({ x, y, w, h, alpha: paintAlpha }));
+  return result;
 }
 
 function _publishDiagnostics() {
@@ -525,19 +612,30 @@ function _publishDiagnostics() {
   const dataset = _hostCanvas.dataset;
   dataset.profile = _lastDiagnostics.profile || 'OFF';
   dataset.densityPct = String(_lastDiagnostics.densityPct ?? _densityPct);
-  dataset.allocationStrategy = _lastDiagnostics.allocationStrategy || _allocationStrategy;
+  dataset.allocationStrategy =
+    _lastDiagnostics.allocationStrategy || _allocationStrategy;
   dataset.solveRevision = String(_lastDiagnostics.solveRevision ?? 0);
-  dataset.collectiveLabelBudget = String(_lastDiagnostics.collectiveLabelBudget ?? 0);
+  dataset.collectiveLabelBudget = String(
+    _lastDiagnostics.collectiveLabelBudget ?? 0,
+  );
   dataset.labelsByLayer = JSON.stringify(_lastDiagnostics.labelsByLayer || {});
-  dataset.entitlementByLayer = JSON.stringify(_lastDiagnostics.entitlementByLayer || {});
+  dataset.entitlementByLayer = JSON.stringify(
+    _lastDiagnostics.entitlementByLayer || {},
+  );
   dataset.labeledKeys = JSON.stringify(_lastDiagnostics.labeledKeys || []);
-  dataset.labelAlphaByKey = JSON.stringify(_lastDiagnostics.labelAlphaByKey || {});
-  dataset.bracketOpacityCounts = JSON.stringify(_lastDiagnostics.bracketOpacityCounts || {});
+  dataset.labelAlphaByKey = JSON.stringify(
+    _lastDiagnostics.labelAlphaByKey || {},
+  );
+  dataset.bracketOpacityCounts = JSON.stringify(
+    _lastDiagnostics.bracketOpacityCounts || {},
+  );
   dataset.keyholeRadius = String(_lastDiagnostics.keyholeRadius ?? 0);
   dataset.keyholeFeatherPx = String(_lastDiagnostics.keyholeFeatherPx ?? 0);
   dataset.demandByLayer = JSON.stringify(_lastDiagnostics.demandByLayer || {});
   dataset.cohortByLayer = JSON.stringify(_lastDiagnostics.cohortByLayer || {});
-  dataset.placementBuildCount = String(_lastDiagnostics.placementBuildCount ?? 0);
+  dataset.placementBuildCount = String(
+    _lastDiagnostics.placementBuildCount ?? 0,
+  );
   dataset.observationCount = String(_lastDiagnostics.observationCount ?? 0);
   dataset.selectedCount = String(_lastDiagnostics.selectedCount ?? 0);
   dataset.fadingCount = String(_lastDiagnostics.fadingCount ?? 0);
@@ -620,9 +718,16 @@ function _applyModeState() {
     _syncSurfaceVisibility();
     _setLanesActive(false);
     _labelArbiter.clear();
+    _surfaceOcclusion.clear();
+    _surfaceSuppressedKeys.clear();
+    _occlusionProbe.reset();
     _lastLabelSolveAt = 0;
     _labelSolveDirty = true;
-    _lastSolveSnapshot = { demandByLayer: {}, cohortByLayer: {}, cohortCount: 0 };
+    _lastSolveSnapshot = {
+      demandByLayer: {},
+      cohortByLayer: {},
+      cohortCount: 0,
+    };
   } else {
     _enableTime = _nowMs(); // restart the subtle fade-in on (re)activation
     _syncSurfaceVisibility();
@@ -642,7 +747,18 @@ function _applyModeState() {
 function _shouldPaintDetectionLane(frame) {
   if (_mode === MODE_OFF || _suspended) return false;
   const layoutChanged = frame.layoutRevision !== _hostLayoutRevision;
+  const nowMs = Number.isFinite(frame.timestamp) ? frame.timestamp : _nowMs();
   _frameCount++;
+  if (isCyberSonarActive()) {
+    const sonarDelay = cyberSonarFrameDelay(_lastCyberSonarPaintAt, nowMs);
+    if (!layoutChanged && sonarDelay > 0) {
+      _scheduleCyberSonarRender(nowMs);
+      return false;
+    }
+  } else {
+    _clearCyberSonarRenderTimer();
+    _lastCyberSonarPaintAt = Number.NEGATIVE_INFINITY;
+  }
   // The skip and the follow-up request come from ONE decision, so the valve
   // cannot drop a frame without handing its request forward — see
   // `detectionPaintSkipDecision`. (Skipping is a deferral, never a cancellation:
@@ -655,8 +771,10 @@ function _shouldPaintDetectionLane(frame) {
   });
   if (decision.skip) {
     _throttleSkipCount++;
-    if (_lastDiagnostics) _lastDiagnostics.throttleSkipCount = _throttleSkipCount;
-    if (decision.requestFollowUp) governorRequestRender('detection-paint-skipped');
+    if (_lastDiagnostics)
+      _lastDiagnostics.throttleSkipCount = _throttleSkipCount;
+    if (decision.requestFollowUp)
+      governorRequestRender('detection-paint-skipped');
     return false;
   }
   return true;
@@ -677,11 +795,24 @@ function _paintDetectionLane(frame) {
     _labelSolveDirty = true;
   }
   const start = performance.now();
-  const result = _drawOverlay(frame)
-    || { didSolve: false, solveMs: 0, fadingCount: 0, animatingCount: 0, solvePending: false };
+  const result = _drawOverlay(frame) || {
+    didSolve: false,
+    solveMs: 0,
+    fadingCount: 0,
+    animatingCount: 0,
+    solvePending: false,
+  };
   _lastRenderMs = performance.now() - start;
   _lastSolveMs = result.solveMs || 0;
   _lastPaintMs = Math.max(0, _lastRenderMs - _lastSolveMs);
+  const nowMs = Number.isFinite(frame.timestamp) ? frame.timestamp : _nowMs();
+  if (isCyberSonarActive() && _lastDiagnostics?.visibleCount > 0) {
+    _lastCyberSonarPaintAt = nowMs;
+    _scheduleCyberSonarRender(nowMs);
+  } else {
+    _clearCyberSonarRenderTimer();
+    _lastCyberSonarPaintAt = Number.NEGATIVE_INFINITY;
+  }
   if (_lastDiagnostics) {
     _lastDiagnostics.frameTotalMs = _lastRenderMs;
     _lastDiagnostics.paintMs = _lastPaintMs;
@@ -695,17 +826,19 @@ function _paintDetectionLane(frame) {
   // exactly what makes it safe where the old blanket hold was not. On a parked
   // scene with nothing animating it asks for nothing, and the governor stays
   // idle. See `detectionRenderDemand.js`.
-  if (detectionNeedsFollowUpFrame({
-    active: _mode !== MODE_OFF && !_suspended,
-    // The frame's OWN timestamp, not a fresh sample — re-reading the clock here
-    // is what dropped the terminal frame of a fade (paint at 219 ms, policy at
-    // 220 ms, and the settled alpha never painted).
-    nowMs: Number.isFinite(frame.timestamp) ? frame.timestamp : _nowMs(),
-    enabledAtMs: _enableTime,
-    fadeMs: FADE_MS,
-    animatingLabelCount: result.animatingCount || 0,
-    solvePending: result.solvePending === true,
-  })) {
+  if (
+    detectionNeedsFollowUpFrame({
+      active: _mode !== MODE_OFF && !_suspended,
+      // The frame's OWN timestamp, not a fresh sample — re-reading the clock here
+      // is what dropped the terminal frame of a fade (paint at 219 ms, policy at
+      // 220 ms, and the settled alpha never painted).
+      nowMs,
+      enabledAtMs: _enableTime,
+      fadeMs: FADE_MS,
+      animatingLabelCount: result.animatingCount || 0,
+      solvePending: result.solvePending === true,
+    })
+  ) {
     governorRequestRender('detection-animation');
   }
 }
@@ -794,7 +927,8 @@ function _drawModeBanner(visibleCount, sampledCount) {
   if (!_debugBanner) return;
   const mode = MODE_LABELS[_mode];
   const paused = _suspended ? `  PAUSED:${_suspendReason || 'transition'}` : '';
-  const allocation = _allocationStrategy === ALLOCATION_ELASTIC ? 'ELASTIC' : 'WEIGHTED';
+  const allocation =
+    _allocationStrategy === ALLOCATION_ELASTIC ? 'ELASTIC' : 'WEIGHTED';
   const text = `${mode}  VIS:${visibleCount}  SRC:${sampledCount}  DENS:${_densityPct}%  ${allocation}  ${_lastRenderMs.toFixed(1)}ms${paused}`;
   _ctx.fillStyle = _theme.labelBg;
   _ctx.fillRect(12, 12, Math.max(180, _ctx.measureText(text).width + 12), 16);
@@ -890,16 +1024,27 @@ function _buildLabelPlacements(
   const placements = [];
   for (const placement of raw) {
     const { cardX, cardY } = placement;
-    if (cardX < margin || cardY < margin || cardX + card.w > width - margin || cardY + card.h > height - margin) {
+    if (
+      cardX < margin ||
+      cardY < margin ||
+      cardX + card.w > width - margin ||
+      cardY + card.h > height - margin
+    ) {
       continue;
     }
     const cardRect = { x: cardX, y: cardY, w: card.w, h: card.h };
     if (rectIntersectsAny(cardRect, occlusionRects)) continue;
     const leadToX = placement.leadToSide.endsWith('E') ? cardX + card.w : cardX;
-    const leadToY = placement.leadToSide.startsWith('S') ? cardY + card.h : cardY;
+    const leadToY = placement.leadToSide.startsWith('S')
+      ? cardY + card.h
+      : cardY;
     const centerX = cardX + card.w * 0.5;
     const centerY = cardY + card.h * 0.5;
-    const radialAlpha = keyholeLabelAlphaFromGeometry(centerX, centerY, keyhole);
+    const radialAlpha = keyholeLabelAlphaFromGeometry(
+      centerX,
+      centerY,
+      keyhole,
+    );
     if (radialAlpha <= 0) continue;
     placements.push({
       ...placement,
@@ -930,18 +1075,41 @@ function _buildLabelPlacements(
  */
 function _stashCallout(entry, acquireFade, keyhole) {
   const { candidate, placement, temporalAlpha } = entry;
-  const radialAlpha = keyholeLabelAlphaFromGeometry(placement.centerX, placement.centerY, keyhole);
-  const alpha = acquireFade * temporalAlpha * radialAlpha;
+  const radialAlpha = keyholeLabelAlphaFromGeometry(
+    placement.centerX,
+    placement.centerY,
+    keyhole,
+  );
+  const alpha =
+    acquireFade * temporalAlpha * radialAlpha * (candidate.sonarFactor ?? 1);
   if (alpha <= 0.001) return;
 
   let row = _calloutPool[_calloutCount];
   if (!row) {
     row = {
-      x: 0, y: 0, w: 0, h: 0,
-      primaryX: 0, microX: 0, baseline: 0,
-      leadFromX: 0, leadFromY: 0, leadToX: 0, leadToY: 0,
-      plate: '', plateScale: 1, accent: '', label: '', primary: '', micro: '',
-      font: FONT, microFont: MICRO_FONT, alpha: 1,
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      primaryX: 0,
+      microX: 0,
+      baseline: 0,
+      leadFromX: 0,
+      leadFromY: 0,
+      leadToX: 0,
+      leadToY: 0,
+      plate: '',
+      plateScale: 1,
+      accent: '',
+      label: '',
+      primary: '',
+      micro: '',
+      font: FONT,
+      microFont: MICRO_FONT,
+      alpha: 1,
+      cardSourceId: '',
+      cardEntryId: '',
+      paintAlpha: 1,
     };
     _calloutPool[_calloutCount] = row;
   }
@@ -968,6 +1136,8 @@ function _stashCallout(entry, acquireFade, keyhole) {
   row.font = FONT;
   row.microFont = MICRO_FONT;
   row.alpha = alpha;
+  row.cardSourceId = candidate.cardSourceId;
+  row.cardEntryId = candidate.cardEntryId;
   _calloutCount++;
 }
 
@@ -981,14 +1151,33 @@ function _stashCallout(entry, acquireFade, keyhole) {
  * @param {Object} frame Host paint frame.
  */
 function _paintCalloutLane(frame) {
-  if (_mode === MODE_OFF || _suspended || _calloutCount === 0) return;
+  if (_mode === MODE_OFF || _suspended) return;
   const ctx = frame.ctx;
   if (!ctx) return;
+  for (const bands of _transitBracketPaths.values()) {
+    for (const entry of bands) {
+      if (entry)
+        paintTransitBracket(
+          ctx,
+          entry.path,
+          entry.color,
+          entry.alpha * _transitBracketAlpha,
+        );
+    }
+  }
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
   for (let i = 0; i < _calloutCount; i++) {
     const row = _calloutPool[i];
-    paintDetectionCallout(ctx, row, row.alpha);
+    // The callout would show through its contact's own card: fade it by the
+    // opacity that card paints with this frame.
+    const cardAlpha =
+      row.cardEntryId === ''
+        ? 0
+        : getQueuedOverlayEntryAlpha(row.cardSourceId, row.cardEntryId);
+    row.paintAlpha =
+      row.alpha * Math.max(0, 1 - cardAlpha / CARD_ALPHA_HIDING_CALLOUT);
+    if (row.paintAlpha > 0.001) paintDetectionCallout(ctx, row, row.paintAlpha);
   }
   ctx.globalAlpha = 1;
 }
@@ -1006,7 +1195,14 @@ function _plateScaleForBackdrop(skyFactor) {
 }
 
 /** Materialize one bounded rich-callout candidate for the existing arbiter. */
-function _materializeCandidate(obj, width, height, keyhole, occlusionRects, cameraPosition) {
+function _materializeCandidate(
+  obj,
+  width,
+  height,
+  keyhole,
+  occlusionRects,
+  cameraPosition,
+) {
   const primary = obj._candidatePrimary;
   const micro = obj._candidateMicro;
   const card = measureTrackLabel(primary, micro, _charWidth);
@@ -1027,7 +1223,10 @@ function _materializeCandidate(obj, width, height, keyhole, occlusionRects, came
   for (const placement of placements) {
     centerDistance = Math.min(
       centerDistance,
-      Math.hypot(placement.centerX - keyhole.centerX, placement.centerY - keyhole.centerY),
+      Math.hypot(
+        placement.centerX - keyhole.centerX,
+        placement.centerY - keyhole.centerY,
+      ),
     );
     keyholeAlpha = Math.max(keyholeAlpha, placement.keyholeAlpha);
   }
@@ -1045,13 +1244,18 @@ function _materializeCandidate(obj, width, height, keyhole, occlusionRects, came
     keyholeAlpha,
     placements,
     color: obj._candidateColor,
+    sonarFactor: obj._candidateSonarFactor ?? 1,
     // Costed here rather than in the object sweep: the sweep walks every
     // observation in view, while this runs only for callouts that actually
     // placed — a budgeted handful per frame.
-    plateScale: _plateScaleForBackdrop(skyBackdropFactor(cameraPosition, obj.position)),
+    plateScale: _plateScaleForBackdrop(
+      skyBackdropFactor(cameraPosition, obj.position),
+    ),
     primary,
     micro,
     hasMicro: card.hasMicro,
+    cardSourceId: obj.cardSourceId ? String(obj.cardSourceId) : '',
+    cardEntryId: obj.cardEntryId ? String(obj.cardEntryId) : '',
   };
 }
 
@@ -1061,22 +1265,36 @@ function _materializeCandidate(obj, width, height, keyhole, occlusionRects, came
  * for a bounded cohort on solve ticks.
  */
 function _drawOverlay(frame) {
+  _transitBracketPaths.clear();
   const { width, height } = frame;
   if (!_ctx || width <= 0 || height <= 0) {
-    return { didSolve: false, solveMs: 0, fadingCount: 0, animatingCount: 0, solvePending: false };
+    return {
+      didSolve: false,
+      solveMs: 0,
+      fadingCount: 0,
+      animatingCount: 0,
+      solvePending: false,
+    };
   }
 
   // ONE timestamp per frame, monotonic, shared with the demand policy below and
   // with every arbiter call in this function — so the frame that paints an
   // animation's final state is the same frame that ends its demand.
   const now = Number.isFinite(frame.timestamp) ? frame.timestamp : _nowMs();
+  const sonarActive = isCyberSonarActive();
+  const cyberMapActive = isCyberMapThemeActive();
+  const sonarSampler = createCyberSonarSampler(width, height, now);
   const bracketPresentationOpacity = detectionBracketOpacity(_cockpitActive);
-  const shouldSolve = _labelSolveDirty || now - _lastLabelSolveAt >= LABEL_SOLVE_INTERVAL_MS;
+  const shouldSolve =
+    _labelSolveDirty || now - _lastLabelSolveAt >= LABEL_SOLVE_INTERVAL_MS;
   const calloutOcclusionRects = frame.uiRects;
   const selectedIdentities = shouldSolve
     ? _labelArbiter.liveIdentities({ includeFading: false, now })
     : null;
-  const renderIdentities = _labelArbiter.liveIdentities({ includeFading: true, now });
+  const renderIdentities = _labelArbiter.liveIdentities({
+    includeFading: true,
+    now,
+  });
   const objects = _collectDetectableObjects();
   const sampledCount = objects.length;
   if (objects.length === 0) {
@@ -1100,7 +1318,9 @@ function _drawOverlay(frame) {
       profile: MODE_LABELS[_mode],
       densityPct: _densityPct,
       allocationStrategy: _allocationStrategy,
-      viewScale: viewScaleForAltitude(_viewer?.camera?.positionCartographic?.height),
+      viewScale: viewScaleForAltitude(
+        _viewer?.camera?.positionCartographic?.height,
+      ),
       candidateCount: 0,
       observationCount: 0,
       visibleCount: 0,
@@ -1128,13 +1348,22 @@ function _drawOverlay(frame) {
     // whole mechanism exists to remove.
     _lastLabelSolveAt = now;
     _labelSolveDirty = false;
-    return { didSolve: false, solveMs: 0, fadingCount: 0, animatingCount: 0, solvePending: false };
+    return {
+      didSolve: false,
+      solveMs: 0,
+      fadingCount: 0,
+      animatingCount: 0,
+      solvePending: false,
+    };
   }
 
   // Horizon culling, keyhole geometry, and camera transforms are shared with
   // every host lane. Detection retains the manual scalar projection below.
   const occluder = frame.occluder;
   const camPos = frame.cameraPosition;
+  // Answers to the occlusion tests started on earlier frames land here.
+  _surfaceOcclusion.beginFrame(now);
+  _occlusionProbe.beginFrame(_viewer?.scene, _surfaceOcclusion.now);
   const keyhole = frame.keyhole;
   // Read the OUTSIDE setting ONCE per paint, from the same module state the
   // host's own keyhole alpha comes from, so a bracket and its callout can never
@@ -1162,8 +1391,16 @@ function _drawOverlay(frame) {
   const tiers = _theme.tiers || null;
   const colorFor = (key) => (tiers && tiers[key]) || _theme.line;
   const bracketPaths = new Map();
+  // Global Context sonar echoes: a second bracket, banded by strength, around
+  // each flight or vessel a pulse front has just crossed.
+  // Resting pulses light nothing, so the per-contact echo work is skipped.
+  const echoField = awarenessEchoActive(now) ? getAwarenessEchoField() : null;
+  const echoPaths = echoField ? new Array(ECHO_ALPHA_STEPS + 1) : null;
   const pathFor = (map, color, alpha) => {
-    const band = Math.max(1, Math.min(BRACKET_ALPHA_STEPS, Math.ceil(alpha * BRACKET_ALPHA_STEPS)));
+    const band = Math.max(
+      1,
+      Math.min(BRACKET_ALPHA_STEPS, Math.ceil(alpha * BRACKET_ALPHA_STEPS)),
+    );
     let bands = map.get(color);
     if (!bands) {
       bands = new Array(BRACKET_ALPHA_STEPS + 1);
@@ -1201,8 +1438,10 @@ function _drawOverlay(frame) {
     const clipW = vp3 * px + vp7 * py + vp11 * pz + vp15;
     if (clipW <= 0) continue;
     const invW = 1 / clipW;
-    const sx = ((vp0 * px + vp4 * py + vp8 * pz + vp12) * invW * 0.5 + 0.5) * width;
-    const sy = (0.5 - (vp1 * px + vp5 * py + vp9 * pz + vp13) * invW * 0.5) * height;
+    const sx =
+      ((vp0 * px + vp4 * py + vp8 * pz + vp12) * invW * 0.5 + 0.5) * width;
+    const sy =
+      (0.5 - (vp1 * px + vp5 * py + vp9 * pz + vp13) * invW * 0.5) * height;
 
     // Tracked objects (skipLabel) get larger boxes. AIR reticles scale with the
     // plane's on-screen size (same scaleByDistance curve as the billboards) so
@@ -1213,26 +1452,95 @@ function _drawOverlay(frame) {
     if (obj.type === 'AIR') {
       const bscale = nearFarScale(
         Cesium.Cartesian3.distance(camPos, obj.position),
-        BILL_NEAR, BILL_NEAR_SCALE, BILL_FAR, BILL_FAR_SCALE,
+        BILL_NEAR,
+        BILL_NEAR_SCALE,
+        BILL_FAR,
+        BILL_FAR_SCALE,
       );
       halfW = _clamp((isTracked ? 14 : 9) * bscale, 7, 48);
       halfH = _clamp((isTracked ? 11 : 7) * bscale, 5, 38);
+    } else if (obj.tier?.startsWith('transit_') && obj.bracketHalfWidth > 0) {
+      halfW = obj.bracketHalfWidth;
+      halfH = obj.bracketHalfHeight;
     } else {
       halfW = _mode === MODE_DENSE ? (isTracked ? 28 : 11) : 16;
       halfH = _mode === MODE_DENSE ? (isTracked ? 22 : 7) : 10;
     }
     // Viewport bounds check with padding
-    if (sx < -halfW || sx > width + halfW || sy < -halfH || sy > height + halfH) continue;
+    if (sx < -halfW || sx > width + halfW || sy < -halfH || sy > height + halfH)
+      continue;
 
     // Tier color drives the bracket, accent bar, and leader line for this object.
     // The bracket follows the same linear radial keyhole fade as its callout.
     const color = colorFor(resolveTier(obj));
     const keyholeAlpha = keyholeLabelAlphaFromGeometry(sx, sy, keyhole);
-    const bracketAlpha = detectionBracketAlpha(obj.type, keyholeAlpha, keyholeOutsideOpacity);
+    // Something the scene drew in front of a depth-tested contact hides its
+    // bracket and callout too, on every frame, not only on solves.
+    if (obj.depthTested === true) {
+      const testedLayerId = obj._layerId || 'unknown';
+      const testedSourceId = obj.sourceId ?? obj.id ?? i;
+      const hidden = _surfaceOcclusion.isHidden(
+        testedLayerId,
+        testedSourceId,
+        obj.position,
+      );
+      // If the arbiter holds a callout for this contact it would keep painting
+      // it until the next solve, and then fade it out where it last stood;
+      // see `_surfaceSuppressedKeys`. Only held contacts cost a key.
+      if (
+        (hidden || _surfaceSuppressedKeys.size > 0) &&
+        renderIdentities.get(testedLayerId)?.has(testedSourceId)
+      ) {
+        const key = _detectionKey(testedLayerId, testedSourceId);
+        if (hidden) _surfaceSuppressedKeys.add(key);
+        else _surfaceSuppressedKeys.delete(key);
+      }
+      if (hidden) continue;
+    }
+    const sonarFactor =
+      sonarActive && !obj.skipLabel ? sonarSampler.at(sx, sy) : 1;
+    const sonarLabelFactor = sonarSampler.label(sonarFactor);
+    const admissionAlpha = detectionBracketAlpha(
+      obj.type,
+      keyholeAlpha,
+      keyholeOutsideOpacity,
+      cyberMapActive,
+    );
+    const bracketAlpha = admissionAlpha * sonarFactor;
     if (bracketAlpha > 0) {
-      appendCornerBracket(pathFor(bracketPaths, color, bracketAlpha), sx, sy, halfW, halfH);
+      const transit = obj.tier?.startsWith('transit_');
+      (transit ? appendTransitBracket : appendCornerBracket)(
+        pathFor(
+          transit ? _transitBracketPaths : bracketPaths,
+          color,
+          bracketAlpha,
+        ),
+        sx,
+        sy,
+        halfW,
+        halfH,
+      );
       visibleCount++;
-      if (obj.type === 'AIR') aircraftBracketSectors[detectionHorizontalSector(sx, width)]++;
+      if (echoPaths) {
+        // Starts on the contact's bracket and spreads outward as it fades.
+        const echo = awarenessEchoBracket(
+          obj._layerId,
+          obj.position,
+          now,
+          bracketAlpha,
+          ECHO_ALPHA_STEPS,
+        );
+        if (echo)
+          appendCornerBracket(
+            (echoPaths[echo.band] ??= new Path2D()),
+            sx,
+            sy,
+            halfW + echo.spreadPx,
+            halfH + echo.spreadPx,
+          );
+      }
+      if (obj.type === 'AIR')
+        aircraftBracketSectors[detectionHorizontalSector(sx, width)]++;
       if (bracketAlpha >= 1) bracketOpacityCounts.full++;
       else bracketOpacityCounts.partial++;
     } else {
@@ -1254,20 +1562,24 @@ function _drawOverlay(frame) {
 
     obj._cohortSourceId = sourceId;
     obj._cohortPriority = _semanticPriority(obj);
-    obj._cohortBand = bracketAlpha >= 0.999 ? 8 : Math.floor(bracketAlpha * 8);
+    obj._cohortBand =
+      admissionAlpha >= 0.999 ? 8 : Math.floor(admissionAlpha * 8);
     obj._cohortHash = stableIdentityHash(layerId, sourceId);
     obj._candidateScreenX = sx;
     obj._candidateScreenY = sy;
     obj._candidateHalfW = halfW;
     obj._candidateHalfH = halfH;
     obj._candidateColor = color;
+    obj._candidateSonarFactor = sonarLabelFactor;
     obj._candidatePrimary = primary;
     obj._candidateMicro = micro;
 
     if (shouldSolve && keyholeAlpha > 0) {
       demandByLayer.set(layerId, (demandByLayer.get(layerId) || 0) + 1);
-      if (!cohortBuilders.has(layerId)) cohortBuilders.set(layerId, new BoundedCohort(256));
-      const incumbent = selectedIdentities?.get(layerId)?.has(sourceId) || false;
+      if (!cohortBuilders.has(layerId))
+        cohortBuilders.set(layerId, new BoundedCohort(256));
+      const incumbent =
+        selectedIdentities?.get(layerId)?.has(sourceId) || false;
       cohortBuilders.get(layerId).consider(obj, incumbent);
     }
 
@@ -1281,16 +1593,29 @@ function _drawOverlay(frame) {
         calloutOcclusionRects,
         camPos,
       );
-      if (candidate && !candidateMap.has(candidate.key)) candidateMap.set(candidate.key, candidate);
+      if (candidate && !candidateMap.has(candidate.key))
+        candidateMap.set(candidate.key, candidate);
     }
   }
+  // Start this frame's occlusion tests; nothing here waits for them.
+  _occlusionProbe.endFrame();
 
   const altitude = _viewer?.camera?.positionCartographic?.height ?? 1e9;
   const collectiveBudget = labelBudgetFor(altitude, _densityPct);
-  const ambientBudget = Math.max(0, collectiveBudget - Math.min(collectiveBudget, protectedVisibleCount));
+  const ambientBudget = Math.max(
+    0,
+    collectiveBudget - Math.min(collectiveBudget, protectedVisibleCount),
+  );
   let didSolve = false;
   let solveMs = 0;
   if (shouldSolve) {
+    _surfaceOcclusion.prune();
+    if (_occlusionProbe.mode === 'sync' && !_surfaceDepthFallbackReported) {
+      _surfaceDepthFallbackReported = true;
+      console.info(
+        '[detection] No occlusion queries here (WebGL 1); street-vehicle label occlusion reads the frame depth back synchronously, about 8 times a second.',
+      );
+    }
     const quotas = allocateLayerQuotas(
       demandByLayer,
       ambientBudget,
@@ -1300,7 +1625,9 @@ function _drawOverlay(frame) {
     const solveCandidates = [];
     const cohortByLayer = {};
     for (const [layerId, builder] of cohortBuilders) {
-      const cohort = builder.values(cohortCapForQuota(quotas.get(layerId) || 0));
+      const cohort = builder.values(
+        cohortCapForQuota(quotas.get(layerId) || 0),
+      );
       for (const obj of cohort) {
         const key = _detectionKey(layerId, obj._cohortSourceId);
         let candidate = candidateMap.get(key);
@@ -1318,7 +1645,9 @@ function _drawOverlay(frame) {
         }
         if (candidate) solveCandidates.push(candidate);
       }
-      cohortByLayer[layerId] = solveCandidates.filter((candidate) => candidate.layerId === layerId).length;
+      cohortByLayer[layerId] = solveCandidates.filter(
+        (candidate) => candidate.layerId === layerId,
+      ).length;
     }
     const solveStarted = performance.now();
     _labelArbiter.solve(solveCandidates, {
@@ -1346,6 +1675,7 @@ function _drawOverlay(frame) {
 
   const fade = acquireAlpha(_enableTime, now, FADE_MS);
   const bracketWidth = _mode === MODE_DENSE ? 1 : 1.25;
+  _transitBracketAlpha = fade * bracketPresentationOpacity;
 
   // Brackets — batched by tier color and linear radial-opacity band.
   _ctx.lineWidth = bracketWidth;
@@ -1357,8 +1687,40 @@ function _drawOverlay(frame) {
       _ctx.stroke(entry.path);
     }
   }
+  if (echoPaths) {
+    _ctx.lineWidth = echoField.echo.lineWidth;
+    _ctx.strokeStyle = awarenessEchoColor(
+      _theme.line,
+      _theme === THEME_MAP._default,
+    );
+    for (let band = 1; band <= ECHO_ALPHA_STEPS; band++) {
+      if (!echoPaths[band]) continue;
+      _ctx.globalAlpha =
+        fade * (band / ECHO_ALPHA_STEPS) * bracketPresentationOpacity;
+      _ctx.stroke(echoPaths[band]);
+    }
+    _ctx.lineWidth = bracketWidth;
+  }
 
-  const renderEntries = _labelArbiter.renderEntries(candidateMap, now);
+  let renderEntries = _labelArbiter.renderEntries(candidateMap, now);
+  // A callout whose contact has gone behind something goes with it at once:
+  // no carry-over to the next solve and no fade painted on the facade.
+  if (_surfaceSuppressedKeys.size > 0) {
+    const allEntries = renderEntries;
+    renderEntries = allEntries.filter(
+      (entry) => !_surfaceSuppressedKeys.has(entry.candidate.key),
+    );
+    // The arbiter has let some of them go: forget those.
+    if (
+      allEntries.length - renderEntries.length !==
+      _surfaceSuppressedKeys.size
+    ) {
+      const held = new Set();
+      for (const entry of allEntries) held.add(entry.candidate.key);
+      for (const key of _surfaceSuppressedKeys)
+        if (!held.has(key)) _surfaceSuppressedKeys.delete(key);
+    }
+  }
   const fadingCount = countFadingRenderEntries(renderEntries);
   // Demand counts fades in BOTH directions; `fadingCount` above stays the
   // fade-OUT tail because that is what the published diagnostics have always
@@ -1398,18 +1760,28 @@ function _drawOverlay(frame) {
       labelsByLayer: arbiterDiagnostics.labelsByLayer || {},
       entitlementByLayer: arbiterDiagnostics.quotas || {},
       labeledKeys: Array.from(_labelArbiter.selectedKeys),
-      labelAlphaByKey: Object.fromEntries(renderEntries.map((entry) => [
-        entry.candidate.key,
-        entry.temporalAlpha * keyholeLabelAlphaFromGeometry(
-          entry.placement.centerX,
-          entry.placement.centerY,
-          keyhole,
-        ),
-      ])),
+      labelAlphaByKey: Object.fromEntries(
+        renderEntries.map((entry) => [
+          entry.candidate.key,
+          entry.temporalAlpha *
+            keyholeLabelAlphaFromGeometry(
+              entry.placement.centerX,
+              entry.placement.centerY,
+              keyhole,
+            ),
+        ]),
+      ),
       solveRevision: _labelArbiter.solveRevision,
       keyholeRadius: keyhole.radius,
       keyholeFeatherPx: keyhole.featherPx,
       calloutOcclusionCount: calloutOcclusionRects.length,
+      surfaceTestedCount: _surfaceOcclusion.testedCount,
+      surfaceHiddenCount: _surfaceOcclusion.hiddenCount,
+      surfaceDepthMode: _occlusionProbe.mode,
+      // Tests started on the last frame, and what collecting answers and
+      // drawing them cost it.
+      surfaceProbeTests: _occlusionProbe.lastFrameTests,
+      surfaceProbeMs: _occlusionProbe.lastFrameMs,
     };
   } else {
     const selectedCount = _labelArbiter.selectedKeys.size;
@@ -1430,5 +1802,11 @@ function _drawOverlay(frame) {
   _drawModeBanner(visibleCount, sampledCount);
   // `_labelSolveDirty` surviving a paint means the solve was owed and did not
   // run — the frame that carried the request cannot be the last one.
-  return { didSolve, solveMs, fadingCount, animatingCount, solvePending: _labelSolveDirty };
+  return {
+    didSolve,
+    solveMs,
+    fadingCount,
+    animatingCount,
+    solvePending: _labelSolveDirty,
+  };
 }
